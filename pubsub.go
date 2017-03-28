@@ -1,6 +1,9 @@
 package pubsub
 
 import (
+	"fmt"
+	"sync"
+
 	"google.golang.org/api/option"
 
 	ps "cloud.google.com/go/pubsub"
@@ -74,8 +77,60 @@ func PushMessage(email, key, project, topic string, msgs ...*ps.Message) error {
 		return err
 	}
 
-	_, err = t.Publish(pubsubCtx, msgs...)
+	var msgIDS []string
+	var wg sync.WaitGroup
+	errorChannel := make(chan error)
+	respChannel := make(chan *ps.PublishResult)
+	msgChannel := make(chan string, len(msgs))
+
+	for w := 1; w <= 5; w++ {
+		go worker(pubsubCtx, respChannel, errorChannel, msgChannel, &wg)
+		wg.Add(1)
+	}
+
+	for _, msg := range msgs {
+		respChannel <- t.Publish(pubsubCtx, msg)
+	}
+
+	close(respChannel)
+	wg.Wait()
+	close(errorChannel)
+	if len(errorChannel) > 0 {
+		err := <-errorChannel
+		return err
+	}
+	close(msgChannel)
+
+	for msgID := range msgChannel {
+		msgIDS = append(msgIDS, msgID)
+	}
+	if len(msgIDS) != len(msgs) {
+		return fmt.Errorf(
+			"failed to push matching number of messages: %d:%d",
+			len(msgs),
+			len(msgIDS),
+		)
+	}
+
 	return err
+}
+
+//Worker function to be used to process PublishResults from the new async Publish function
+func worker(pubCon context.Context, resps chan *ps.PublishResult,
+	res chan error, msg chan string, wg *sync.WaitGroup) {
+	for {
+		resp, more := <-resps
+		if more {
+			srvID, err := resp.Get(pubsubCtx)
+			if err != nil {
+				res <- err
+			}
+			msg <- srvID
+		} else {
+			break
+		}
+	}
+	wg.Done()
 
 }
 
